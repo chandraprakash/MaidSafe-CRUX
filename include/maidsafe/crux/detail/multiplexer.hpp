@@ -111,6 +111,7 @@ private:
     void establish_connection(std::size_t, endpoint_type);
 
     void process_handshake(socket_base&, endpoint_type, std::uint16_t, detail::decoder&);
+
     void process_keepalive(socket_base&, std::uint16_t, detail::decoder&);
     void process_data(socket_base&,
                       std::uint16_t,
@@ -138,6 +139,7 @@ private:
     socket_map sockets;
 
     std::atomic<std::size_t> receive_calls;
+    std::atomic<bool>        is_receiving;
 
     // FIXME: Move to acceptor class
     // FIXME: Bounded queue with pending accept requests? (like listen() backlog)
@@ -178,6 +180,7 @@ std::shared_ptr<multiplexer> multiplexer::create(Types&&... args)
 inline multiplexer::multiplexer(next_layer_type&& udp_socket)
     : udp_socket(std::move(udp_socket))
     , receive_calls(0)
+    , is_receiving(false)
 {
 }
 
@@ -328,13 +331,6 @@ inline multiplexer::endpoint_type multiplexer::local_loopback_endpoint() const {
 
 inline void multiplexer::start_receive()
 {
-    // Each socket and acceptor may invoke only one receive call at a time.
-    // Since both, a socket and an acceptor may invoke this function
-    // from inside a handler, and since the 'receive_calls' counter gets
-    // decreased only after handlers are executed we need to allow an
-    // error by 2.
-    assert(receive_calls < sockets.size() + acceptor_queue.size() + 2U);
-
     if (receive_calls++ == 0)
     {
         do_start_receive();
@@ -343,9 +339,7 @@ inline void multiplexer::start_receive()
 
 inline void multiplexer::stop_receive()
 {
-    // Each socket may invoke only one receive call at a time.
     assert(receive_calls > 0);
-    assert(receive_calls <= sockets.size() + acceptor_queue.size() + 1U);
 
     if (--receive_calls == 0)
     {
@@ -363,6 +357,10 @@ inline void multiplexer::stop_receive()
 
 inline void multiplexer::do_start_receive()
 {
+    if (is_receiving.exchange(true)) {
+      return;
+    }
+
     auto self(shared_from_this());
 
     // We need to read with at least one zero sized buffer to
@@ -394,6 +392,8 @@ void multiplexer::process_peek(boost::system::error_code error,
 {
     namespace asio = boost::asio;
 
+    is_receiving.store(false);
+
     if (!next_layer().is_open()) return;
 
     if (receive_calls == 0) {
@@ -402,8 +402,6 @@ void multiplexer::process_peek(boost::system::error_code error,
         discard_message();
         return;
     }
-
-    assert(receive_calls <= sockets.size() + acceptor_queue.size() + 1U);
 
     switch (error.value())
     {
@@ -418,7 +416,6 @@ void multiplexer::process_peek(boost::system::error_code error,
 
     case boost::asio::error::operation_aborted:
         discard_message();
-        --receive_calls;
         return;
 
     default:
@@ -509,7 +506,7 @@ void multiplexer::process_peek(boost::system::error_code error,
         }
     }
 
-    if (--receive_calls > 0) {
+    if (receive_calls > 0) {
         do_start_receive();
     }
 }
@@ -576,10 +573,7 @@ void multiplexer::establish_connection(std::size_t payload_size,
         acceptor_queue.pop_front();
         process_accept(success,
                        std::get<2>(*input));
-        --receive_calls;
-    }
-    else {
-        ++receive_calls;
+        stop_receive();
     }
 }
 
